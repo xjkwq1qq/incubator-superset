@@ -1,143 +1,155 @@
-""" Superset wrapper around pandas.DataFrame.
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Superset utilities for pandas.DataFrame."""
 
-TODO(bkyryliuk): add support for the conventions like: *_dim or dim_*
-                 dimensions, *_ts, ts_*, ds_*, *_ds - datetime, etc.
-TODO(bkyryliuk): recognize integer encoded enums.
+import logging
+import math
+import warnings
+from decimal import Decimal
+from typing import Any
 
-"""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
-from datetime import datetime, date
-from past.builtins import basestring
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+from superset.utils.core import JS_MAX_INTEGER
 
-INFER_COL_TYPES_THRESHOLD = 95
-INFER_COL_TYPES_SAMPLE_SIZE = 100
+logger = logging.getLogger(__name__)
 
-
-class SupersetDataFrame(object):
-    # Mapping numpy dtype.char to generic database types
-    type_map = {
-        'b': 'BOOL',  # boolean
-        'i': 'INT',  # (signed) integer
-        'u': 'INT',  # unsigned integer
-        'l': 'INT',  # 64bit integer
-        'f': 'FLOAT',  # floating-point
-        'c': 'FLOAT',  # complex-floating point
-        'm': None,  # timedelta
-        'M': 'DATETIME',  # datetime
-        'O': 'OBJECT',  # (Python) objects
-        'S': 'BYTE',  # (byte-)string
-        'U': 'STRING',  # Unicode
-        'V': None,   # raw data (void)
+_NUMPY_FLOAT_TYPES = frozenset(
+    type(value)
+    for value in (np.float16(0), np.float32(0), np.float64(0), np.longdouble(0))
+)
+_PANDAS_MISSING_TYPES = frozenset({type(pd.NA), type(pd.NaT)})
+_NUMPY_NATIVE_TYPES = frozenset(
+    {
+        np.bool_,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.intc,
+        np.intp,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.uintc,
+        np.uintp,
+        np.ulonglong,
+        np.float16,
+        np.float32,
+        np.float64,
+        np.str_,
+        np.bytes_,
     }
+)
 
-    def __init__(self, df):
-        self.__df = df.where((pd.notnull(df)), None)
 
-    @property
-    def size(self):
-        return len(self.__df.index)
+def _convert_big_integers(val: Any) -> Any:
+    """
+    Cast integers larger than ``JS_MAX_INTEGER`` to strings.
 
-    @property
-    def data(self):
-        return self.__df.to_dict(orient='records')
+    :param val: the value to process
+    :returns: the same value but recast as a string if it was an integer over
+        ``JS_MAX_INTEGER``
+    """
+    return str(val) if type(val) is int and abs(val) > JS_MAX_INTEGER else val
 
-    @classmethod
-    def db_type(cls, dtype):
-        """Given a numpy dtype, Returns a generic database type"""
-        return cls.type_map.get(dtype.char)
 
-    @classmethod
-    def datetime_conversion_rate(cls, data_series):
-        success = 0
-        total = 0
-        for value in data_series:
-            total += 1
-            try:
-                pd.to_datetime(value)
-                success += 1
-            except Exception:
-                continue
-        return 100 * success / total
+def _is_trusted_missing_or_nonfinite(value: Any) -> bool:
+    """Recognize producer nulls without consulting object-column hooks."""
+    value_type = type(value)
+    if value_type in _PANDAS_MISSING_TYPES:
+        return True
+    if value_type is Decimal:
+        return not Decimal.is_finite(value)
+    if value_type is float:
+        return not math.isfinite(value)
+    if value_type in _NUMPY_FLOAT_TYPES:
+        return not bool(np.isfinite(value))
+    return False
 
-    @classmethod
-    def is_date(cls, dtype):
-        if dtype.name:
-            return dtype.name.startswith('datetime')
 
-    @classmethod
-    def is_dimension(cls, dtype, column_name):
-        if cls.is_id(column_name):
-            return False
-        return dtype.name in ('object', 'bool')
+def _convert_decimals(value: Any) -> Any:
+    """Keep SQL Lab decimals exact across JSON, MessagePack and browser parsing."""
+    # Match exact types only, as below, so object-column values never get to run
+    # overridden ``items``/``__iter__`` hooks during conversion.
+    value_type = type(value)
+    if value_type is Decimal:
+        return format(value, "f") if Decimal.is_finite(value) else None
+    if value_type is dict:
+        return {key: _convert_decimals(item) for key, item in dict.items(value)}
+    if value_type is list:
+        return [_convert_decimals(item) for item in value]
+    if value_type is tuple:
+        return tuple(_convert_decimals(item) for item in value)
+    return value
 
-    @classmethod
-    def is_id(cls, column_name):
-        return column_name.startswith('id') or column_name.endswith('id')
 
-    @classmethod
-    def agg_func(cls, dtype, column_name):
-        # consider checking for key substring too.
-        if cls.is_id(column_name):
-            return 'count_distinct'
-        if np.issubdtype(dtype, np.number):
-            return 'sum'
+def df_to_records(
+    dframe: pd.DataFrame,
+    *,
+    convert_big_integers: bool = True,
+    convert_decimals: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Convert a DataFrame to a set of records.
 
-    @property
-    def columns(self):
-        """Provides metadata about columns for data visualization.
+    Missing and non-finite values are converted to None for JSON compatibility.
+    This includes infinities produced by trusted pandas post-processing.
 
-        :return: dict, with the fields name, type, is_date, is_dim and agg.
-        """
-        if self.__df.empty:
-            return None
+    :param dframe: the DataFrame to convert
+    :param convert_big_integers: whether integers outside JavaScript's safe range
+        should be represented as strings
+    :param convert_decimals: whether ``Decimal`` values should be represented as
+        exact strings rather than JSON numbers
+    :returns: a list of dictionaries reflecting each single row of the DataFrame
+    """
+    if not dframe.columns.is_unique:
+        message = "DataFrame columns are not unique, some columns will be omitted."
+        logger.warning(message)
+        warnings.warn(message, UserWarning, stacklevel=2)
+    # Materialize first, then inspect only exact trusted scalar types. DataFrame
+    # replacement and generic missing-value checks compare object-column values;
+    # an injected value could run ``__eq__`` before the MCP envelope validator.
+    records = [
+        dict(zip(dframe.columns, row, strict=True))
+        for row in dframe.itertuples(index=False, name=None)
+    ]
 
-        columns = []
-        sample_size = min(INFER_COL_TYPES_SAMPLE_SIZE, len(self.__df.index))
-        sample = self.__df
-        if sample_size:
-            sample = self.__df.sample(sample_size)
-        for col in self.__df.dtypes.keys():
-            col_db_type = self.db_type(self.__df.dtypes[col])
-            column = {
-                'name': col,
-                'agg': self.agg_func(self.__df.dtypes[col], col),
-                'type': col_db_type,
-                'is_date': self.is_date(self.__df.dtypes[col]),
-                'is_dim': self.is_dimension(self.__df.dtypes[col], col),
-            }
+    for record in records:
+        for key, value in dict.items(record):
+            # Restore pandas' native scalar boxing without calling hooks on
+            # arbitrary objects or scalar subclasses. Keep longdouble intact:
+            # converting it to float can overflow or lose precision.
+            if type(value) in _NUMPY_NATIVE_TYPES:
+                value = value.item()
+            elif type(value) is np.timedelta64:
+                value = pd.Timedelta(value)
+            elif type(value) is np.datetime64:
+                value = pd.Timestamp(value)
+            if _is_trusted_missing_or_nonfinite(value):
+                value = None
+            else:
+                if convert_big_integers:
+                    value = _convert_big_integers(value)
+                if convert_decimals:
+                    value = _convert_decimals(value)
+            dict.__setitem__(record, key, value)
 
-            if column['type'] in ('OBJECT', None):
-                v = sample[col].iloc[0] if not sample[col].empty else None
-                if isinstance(v, basestring):
-                    column['type'] = 'STRING'
-                elif isinstance(v, int):
-                    column['type'] = 'INT'
-                elif isinstance(v, float):
-                    column['type'] = 'FLOAT'
-                elif isinstance(v, (datetime, date)):
-                    column['type'] = 'DATETIME'
-                    column['is_date'] = True
-                    column['is_dim'] = False
-                # check if encoded datetime
-                if (
-                        column['type'] == 'STRING' and
-                        self.datetime_conversion_rate(sample[col]) >
-                        INFER_COL_TYPES_THRESHOLD):
-                    column.update({
-                        'is_date': True,
-                        'is_dim': False,
-                        'agg': None
-                    })
-            # 'agg' is optional attribute
-            if not column['agg']:
-                column.pop('agg', None)
-            columns.append(column)
-        return columns
+    return records
